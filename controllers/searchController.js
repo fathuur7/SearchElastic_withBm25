@@ -140,7 +140,19 @@ const searchArticles = async (req, res) => {
 
   try {
     // Ambil semua artikel dari DB
-    const result = await pool.query('SELECT * FROM articles');
+    const result = await pool.query(`
+      SELECT 
+        a.id,
+        a.journal_id,
+        j.name AS journal_name,
+        j.subject_area,
+        a.title,
+        a.institution,
+        a.url,
+        a.year
+      FROM articles a
+      JOIN journals j ON a.journal_id = j.id
+    `);
     const allArticles = result.rows;
 
     console.log('Total articles from DB:', allArticles.length);
@@ -221,4 +233,75 @@ const searchArticles = async (req, res) => {
   }
 };
 
-module.exports = { searchPapers, getDokumen, getDetailPaper, getPapers, searchArticles };
+const GetAllArtikel = async (req, res) => {
+  try {
+    const result = await pool.query(`
+        SELECT 
+          a.id,
+          a.journal_id,
+          j.name AS journal_name,
+          j.subject_area,
+          a.title,
+          a.institution,
+          a.url,
+          a.year
+        FROM articles a
+        JOIN journals j ON a.journal_id = j.id
+        ORDER BY a.year DESC
+        LIMIT 15
+    `);
+
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Gagal mengambil data artikel' });
+  }
+};
+
+
+const autoComplete = async (req, res) => {
+  try {
+    const query = req.query.q?.trim();
+    
+    // Input validation
+    if (!query) {
+      return res.json([]);
+    }
+    
+    // Minimum query length to reduce unnecessary database calls
+    if (query.length < 2) {
+      return res.json([]);
+    }
+    
+    // Sanitize query to prevent potential issues
+    const sanitizedQuery = query.replace(/[%_]/g, '\\$&');
+    
+    const result = await pool.query(`
+      SELECT 
+        a.title
+      FROM articles a
+      WHERE a.title ILIKE $1
+      ORDER BY 
+        CASE 
+          WHEN a.title ILIKE $2 THEN 1
+          WHEN a.title ILIKE $3 THEN 2
+          ELSE 3
+        END,
+        LENGTH(a.title),
+        a.title
+      LIMIT 5
+    `, [
+      `%${sanitizedQuery}%`,
+      `${sanitizedQuery}%`,
+      `% ${sanitizedQuery}%`
+    ]);
+    
+    res.json(result.rows);
+    
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Gagal mengambil data artikel' });
+  }
+};
+
+module.exports = { searchPapers, getDokumen, getDetailPaper, getPapers, searchArticles , GetAllArtikel , autoComplete};
