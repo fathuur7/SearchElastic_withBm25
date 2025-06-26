@@ -1,29 +1,36 @@
 const esClient = require('../config/elasticsearch');
 const pool = require('../config/db'); 
 const BM25 = require('../utils/bm25');
-
+const cache = require('../utils/cache');
 
 const getPapers = async (req, res) => {
   const { page = 1, limit = 5 } = req.query;
   const offset = (page - 1) * limit;
+  
+  // Generate cache key
+  const cacheKey = cache.generateKey(cache.prefixes.PAPER, 'list', page, limit);
 
   try {
-    const result = await esClient.search({
-      index: '6fathur',
-      body: {
-        from: offset,
-        size: limit,
-        query: { match_all: {} },
-        sort: [{ journal_id: { order: 'asc' } }]
-      }
-    });
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const esResult = await esClient.search({
+        index: '6fathur',
+        body: {
+          from: offset,
+          size: limit,
+          query: { match_all: {} },
+          sort: [{ journal_id: { order: 'asc' } }]
+        }
+      });
 
-    const journals = result.hits.hits.map(hit => ({
-      id: hit._id,
-      ...hit._source
-    }));
+      const journals = esResult.hits.hits.map(hit => ({
+        id: hit._id,
+        ...hit._source
+      }));
 
-    res.json({ total: result.hits.total.value, results: journals });
+      return { total: esResult.hits.total.value, results: journals };
+    }, 1800); // Cache for 30 minutes
+
+    res.json(result);
   } catch (err) {
     console.error('Elasticsearch error:', err);
     res.status(500).json({ error: 'Gagal mengambil data jurnal' });
@@ -32,28 +39,44 @@ const getPapers = async (req, res) => {
 
 const getDetailPaper = async (req, res) => {
   const { id } = req.params;
+  
+  // Generate cache key
+  const cacheKey = cache.generateKey(cache.prefixes.PAPER, 'detail', id);
 
   try {
-    const result = await esClient.get({
-      index: '6fathur',
-      id
-    });
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const esResult = await esClient.get({
+        index: '6fathur',
+        id
+      });
 
-    if (!result.found) {
+      if (!esResult.found) {
+        throw new Error('Paper not found');
+      }
+
+      return esResult._source;
+    }, 3600); // Cache for 1 hour
+
+    res.json(result);
+  } catch (error) {
+    if (error.message === 'Paper not found') {
       return res.status(404).json({ error: 'Jurnal tidak ditemukan' });
     }
-
-    res.json(result._source);
-  } catch (error) {
     console.error('Elasticsearch error:', error);
     res.status(500).json({ error: 'Gagal mengambil detail jurnal' });
   }
 };
 
 const getDokumen = async (req, res) => {
+  const cacheKey = cache.generateKey(cache.prefixes.STATS, 'total_journals');
+
   try {
-    const result = await esClient.count({ index: '6fathur' });
-    res.json({ totalJournals: result.count });
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const esResult = await esClient.count({ index: '6fathur' });
+      return { totalJournals: esResult.count };
+    }, 7200); // Cache for 2 hours
+
+    res.json(result);
   } catch (error) {
     console.error('Elasticsearch error:', error);
     res.status(500).json({ error: 'Gagal mengambil jumlah jurnal' });
@@ -66,6 +89,10 @@ const searchPapers = async (req, res) => {
   if (!query) {
     return res.status(400).json({ error: 'Parameter q (query) wajib diisi' });
   }
+
+  // Generate cache key based on query
+  const cacheKey = cache.generateKey(cache.prefixes.SEARCH, 'papers', 
+    Buffer.from(query).toString('base64'));
 
   const esQuery = {
     bool: {
@@ -107,30 +134,33 @@ const searchPapers = async (req, res) => {
   };
 
   try {
-    const result = await esClient.search({
-      index: '6fathur',
-      body: {
-        query: esQuery,
-        highlight: highlight
-      }
-    });
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const esResult = await esClient.search({
+        index: '6fathur',
+        body: {
+          query: esQuery,
+          highlight: highlight
+        }
+      });
 
-    const maxScore = result.hits.max_score || 1;
+      const maxScore = esResult.hits.max_score || 1;
 
-    const hits = result.hits.hits.map(hit => ({
-      id: hit._id,
-      score: +(hit._score / maxScore).toFixed(3),
-      ...hit._source,
-      highlight: hit.highlight || {}
-    }));
+      const hits = esResult.hits.hits.map(hit => ({
+        id: hit._id,
+        score: +(hit._score / maxScore).toFixed(3),
+        ...hit._source,
+        highlight: hit.highlight || {}
+      }));
 
-    res.json({ total: result.hits.total.value, results: hits });
+      return { total: esResult.hits.total.value, results: hits };
+    }, 1800); // Cache for 30 minutes
+
+    res.json(result);
   } catch (error) {
     console.error('Elasticsearch error:', error);
     res.status(500).json({ error: 'Gagal mencari data jurnal' });
   }
 };
-
 
 const searchArticles = async (req, res) => {
   const query = req.query.q?.trim();
@@ -138,94 +168,66 @@ const searchArticles = async (req, res) => {
     return res.status(400).json({ error: 'Parameter q (query) wajib diisi' });
   }
 
+  // Generate cache key
+  const cacheKey = cache.generateKey(cache.prefixes.SEARCH, 'articles', 
+    Buffer.from(query).toString('base64'));
+
   try {
-    // Ambil semua artikel dari DB
-    const result = await pool.query(`
-      SELECT 
-        a.id,
-        a.journal_id,
-        j.name AS journal_name,
-        j.subject_area,
-        a.title,
-        a.institution,
-        a.url,
-        a.year
-      FROM articles a
-      JOIN journals j ON a.journal_id = j.id
-    `);
-    const allArticles = result.rows;
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      // Get all articles from DB (this could also be cached separately)
+      const dbResult = await pool.query(`
+        SELECT 
+          a.id,
+          a.journal_id,
+          j.name AS journal_name,
+          j.subject_area,
+          a.title,
+          a.institution,
+          a.url,
+          a.year
+        FROM articles a
+        JOIN journals j ON a.journal_id = j.id
+      `);
+      const allArticles = dbResult.rows;
 
-    console.log('Total articles from DB:', allArticles.length);
-
-    if (allArticles.length === 0) {
-      return res.json({ total: 0, results: [] });
-    }
-
-    // Inisialisasi BM25 dengan parameter optimal
-    const bm25 = new BM25(1.2, 0.75);
-
-    // Tambahkan semua dokumen ke BM25 corpus
-    console.log('Building BM25 corpus...');
-    allArticles.forEach((article, index) => {
-      bm25.addDocument(article, index);
-    });
-
-    // Get BM25 statistics
-    const stats = bm25.getStats();
-    console.log('BM25 Statistics:', stats);
-
-    // Lakukan pencarian
-    console.log('Searching with query:', query);
-    const bm25Results = bm25.search(query, 50); // Limit 50 hasil
-
-    console.log('BM25 raw results:', bm25Results.length);
-
-    // Normalisasi score ke range 0-1 untuk frontend
-    let normalizedResults = [];
-    if (bm25Results.length > 0) {
-      const scores = bm25Results.map(r => r.score);
-      const maxScore = Math.max(...scores);
-      const minScore = Math.min(...scores);
-      const scoreRange = maxScore - minScore;
-
-      console.log('Score range:', { minScore, maxScore, scoreRange });
-
-      normalizedResults = bm25Results.map(result => ({
-        ...result.document,
-        score: scoreRange === 0 ? 1.0 : Number(((result.score - minScore) / scoreRange).toFixed(3)),
-        // bm25Score: Number(result.score.toFixed(4)), // Simpan original BM25 score untuk debug
-        // docId: result.docId
-      }));
-    }
-
-    console.log('Final results count:', normalizedResults.length);
-    console.log('Top 3 results scores:', normalizedResults.slice(0, 3).map(r => ({
-      title: r.title?.substring(0, 50) + '...',
-      score: r.score,
-      bm25Score: r.bm25Score
-    })));
-
-    res.json({
-      total: normalizedResults.length,
-      results: normalizedResults,
-      debug: {
-        query: query,
-        algorithm: 'BM25',
-        stats: stats,
-        processing: {
-          totalArticles: allArticles.length,
-          matchedArticles: normalizedResults.length,
-          scoreRange: bm25Results.length > 0 ? {
-            min: Math.min(...bm25Results.map(r => r.score)),
-            max: Math.max(...bm25Results.map(r => r.score))
-          } : null
-        }
+      if (allArticles.length === 0) {
+        return { total: 0, results: [] };
       }
-    });
 
+      // Initialize BM25
+      const bm25 = new BM25(1.2, 0.75);
+
+      // Add all documents to BM25 corpus
+      allArticles.forEach((article, index) => {
+        bm25.addDocument(article, index);
+      });
+
+      // Perform search
+      const bm25Results = bm25.search(query, 50);
+
+      // Normalize scores
+      let normalizedResults = [];
+      if (bm25Results.length > 0) {
+        const scores = bm25Results.map(r => r.score);
+        const maxScore = Math.max(...scores);
+        const minScore = Math.min(...scores);
+        const scoreRange = maxScore - minScore;
+
+        normalizedResults = bm25Results.map(result => ({
+          ...result.document,
+          score: scoreRange === 0 ? 1.0 : Number(((result.score - minScore) / scoreRange).toFixed(3))
+        }));
+      }
+
+      return {
+        total: normalizedResults.length,
+        results: normalizedResults
+      };
+    }, 1800); // Cache for 30 minutes
+
+    res.json(result);
   } catch (error) {
     console.error('Error in searchArticles:', error);
-    console.error('Error stack:', error.stack);
     res.status(500).json({ 
       error: 'Gagal mencari artikel dengan BM25',
       details: error.message 
@@ -234,8 +236,11 @@ const searchArticles = async (req, res) => {
 };
 
 const GetAllArtikel = async (req, res) => {
+  const cacheKey = cache.generateKey(cache.prefixes.ARTICLE, 'latest', '15');
+
   try {
-    const result = await pool.query(`
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const dbResult = await pool.query(`
         SELECT 
           a.id,
           a.journal_id,
@@ -249,54 +254,56 @@ const GetAllArtikel = async (req, res) => {
         JOIN journals j ON a.journal_id = j.id
         ORDER BY a.year DESC
         LIMIT 15
-    `);
+      `);
+      return dbResult.rows;
+    }, 3600); // Cache for 1 hour
 
-    res.json(result.rows);
+    res.json(result);
   } catch (error) {
     console.error('Database error:', error);
     res.status(500).json({ error: 'Gagal mengambil data artikel' });
   }
 };
-
 
 const autoComplete = async (req, res) => {
   try {
     const query = req.query.q?.trim();
     
-    // Input validation
-    if (!query) {
+    if (!query || query.length < 2) {
       return res.json([]);
     }
     
-    // Minimum query length to reduce unnecessary database calls
-    if (query.length < 2) {
-      return res.json([]);
-    }
+    // Generate cache key
+    const cacheKey = cache.generateKey(cache.prefixes.AUTOCOMPLETE, 
+      Buffer.from(query.toLowerCase()).toString('base64'));
     
-    // Sanitize query to prevent potential issues
-    const sanitizedQuery = query.replace(/[%_]/g, '\\$&');
+    const result = await cache.cacheWrapper(cacheKey, async () => {
+      const sanitizedQuery = query.replace(/[%_]/g, '\\$&');
+      
+      const dbResult = await pool.query(`
+        SELECT 
+          a.title
+        FROM articles a
+        WHERE a.title ILIKE $1
+        ORDER BY 
+          CASE 
+            WHEN a.title ILIKE $2 THEN 1
+            WHEN a.title ILIKE $3 THEN 2
+            ELSE 3
+          END,
+          LENGTH(a.title),
+          a.title
+        LIMIT 5
+      `, [
+        `%${sanitizedQuery}%`,
+        `${sanitizedQuery}%`,
+        `% ${sanitizedQuery}%`
+      ]);
+      
+      return dbResult.rows;
+    }, 1800); // Cache for 30 minutes
     
-    const result = await pool.query(`
-      SELECT 
-        a.title
-      FROM articles a
-      WHERE a.title ILIKE $1
-      ORDER BY 
-        CASE 
-          WHEN a.title ILIKE $2 THEN 1
-          WHEN a.title ILIKE $3 THEN 2
-          ELSE 3
-        END,
-        LENGTH(a.title),
-        a.title
-      LIMIT 5
-    `, [
-      `%${sanitizedQuery}%`,
-      `${sanitizedQuery}%`,
-      `% ${sanitizedQuery}%`
-    ]);
-    
-    res.json(result.rows);
+    res.json(result);
     
   } catch (error) {
     console.error('Database error:', error);
@@ -304,4 +311,49 @@ const autoComplete = async (req, res) => {
   }
 };
 
-module.exports = { searchPapers, getDokumen, getDetailPaper, getPapers, searchArticles , GetAllArtikel , autoComplete};
+// Cache management endpoints
+const clearCache = async (req, res) => {
+  try {
+    const { pattern } = req.query;
+    
+    if (pattern) {
+      const deletedCount = await cache.delPattern(pattern);
+      res.json({ 
+        message: `Cache cleared for pattern: ${pattern}`,
+        deletedKeys: deletedCount 
+      });
+    } else {
+      // Clear all cache
+      const deletedCount = await cache.delPattern('*');
+      res.json({ 
+        message: 'All cache cleared',
+        deletedKeys: deletedCount 
+      });
+    }
+  } catch (error) {
+    console.error('Clear cache error:', error);
+    res.status(500).json({ error: 'Gagal menghapus cache' });
+  }
+};
+
+const getCacheStats = async (req, res) => {
+  try {
+    const stats = await cache.getStats();
+    res.json(stats);
+  } catch (error) {
+    console.error('Cache stats error:', error);
+    res.status(500).json({ error: 'Gagal mengambil statistik cache' });
+  }
+};
+
+module.exports = { 
+  searchPapers, 
+  getDokumen, 
+  getDetailPaper, 
+  getPapers, 
+  searchArticles, 
+  GetAllArtikel, 
+  autoComplete,
+  clearCache,
+  getCacheStats
+};
