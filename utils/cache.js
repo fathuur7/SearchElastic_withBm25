@@ -1,72 +1,99 @@
-const redisClient = require('../config/redis');
+const redisClient = require('../config/redis'); // Assuming your Redis config is in config/redis.js
 
 class CacheService {
   constructor() {
-    this.defaultTTL = 3600; // 1 hour
     this.prefixes = {
-      SEARCH: 'search:',
-      PAPER: 'paper:',
-      ARTICLE: 'article:',
-      STATS: 'stats:',
-      AUTOCOMPLETE: 'autocomplete:'
+      SEARCH: 'search',
+      PAPER: 'paper',
+      ARTICLE: 'article',
+      AUTOCOMPLETE: 'autocomplete',  
+      STATS: 'stats'
     };
   }
 
-  // Generate cache key with prefix
-  generateKey(prefix, ...parts) {
-    return prefix + parts.join(':');
+  generateKey(...parts) {
+    return parts.filter(part => part !== undefined && part !== null).join(':');
   }
 
-  // Get data from cache
   async get(key) {
     try {
+      // Check if client is connected
+      if (!redisClient.isOpen) {
+        console.warn('Redis client not connected, skipping cache get');
+        return null;
+      }
+
       const data = await redisClient.get(key);
       return data ? JSON.parse(data) : null;
     } catch (error) {
       console.error('Cache get error:', error);
-      return null;
+      return null; // Return null on error to allow fallback to source
     }
   }
 
-  // Set data to cache
-  async set(key, data, ttl = this.defaultTTL) {
+  async set(key, value, ttlSeconds = 3600) {
     try {
-      await redisClient.setex(key, ttl, JSON.stringify(data));
+      // Check if client is connected
+      if (!redisClient.isOpen) {
+        console.warn('Redis client not connected, skipping cache set');
+        return false;
+      }
+
+      // Use the modern Redis v4+ API - note the capital E in setEx
+      await redisClient.setEx(key, ttlSeconds, JSON.stringify(value));
       return true;
     } catch (error) {
       console.error('Cache set error:', error);
-      return false;
+      // Try alternative method if setEx fails
+      try {
+        await redisClient.set(key, JSON.stringify(value), { EX: ttlSeconds });
+        return true;
+      } catch (altError) {
+        console.error('Alternative cache set also failed:', altError);
+        return false;
+      }
     }
   }
 
-  // Delete from cache
   async del(key) {
     try {
-      await redisClient.del(key);
-      return true;
+      if (!redisClient.isOpen) {
+        console.warn('Redis client not connected, skipping cache delete');
+        return 0;
+      }
+
+      return await redisClient.del(key);
     } catch (error) {
       console.error('Cache delete error:', error);
-      return false;
-    }
-  }
-
-  // Delete multiple keys with pattern
-  async delPattern(pattern) {
-    try {
-      const keys = await redisClient.keys(pattern);
-      if (keys.length > 0) {
-        await redisClient.del(...keys);
-      }
-      return keys.length;
-    } catch (error) {
-      console.error('Cache delete pattern error:', error);
       return 0;
     }
   }
 
-  // Check if key exists
+  async delPattern(pattern) {
+    try {
+      if (!redisClient.isOpen) {
+        console.warn('Redis client not connected, skipping cache pattern delete');
+        return 0;
+      }
+
+      const keys = await redisClient.keys(pattern);
+      if (keys.length === 0) {
+        return 0;
+      }
+
+      return await redisClient.del(keys);
+    } catch (error) {
+      console.error('Cache pattern delete error:', error);
+      return 0;
+    }
+  }
+
   async exists(key) {
     try {
+      if (!redisClient.isOpen) {
+        return false;
+      }
+
       return await redisClient.exists(key);
     } catch (error) {
       console.error('Cache exists error:', error);
@@ -74,45 +101,92 @@ class CacheService {
     }
   }
 
-  // Get cache statistics
   async getStats() {
     try {
+      if (!redisClient.isOpen) {
+        return { error: 'Redis client not connected' };
+      }
+
       const info = await redisClient.info('memory');
       const keyspace = await redisClient.info('keyspace');
+      const stats = await redisClient.info('stats');
+
       return {
         memory: info,
-        keyspace: keyspace
+        keyspace: keyspace,
+        stats: stats,
+        connected: redisClient.isOpen
       };
     } catch (error) {
       console.error('Cache stats error:', error);
-      return null;
+      return { error: error.message };
     }
   }
 
-  // Cache wrapper for functions
-  async cacheWrapper(key, fn, ttl = this.defaultTTL) {
+  async cacheWrapper(key, dataFetcher, ttlSeconds = 3600) {
     try {
       // Try to get from cache first
-      const cached = await this.get(key);
-      if (cached !== null) {
+      const cachedData = await this.get(key);
+      if (cachedData !== null) {
         console.log(`Cache hit for key: ${key}`);
-        return cached;
+        return cachedData;
       }
 
-      // If not in cache, execute function
       console.log(`Cache miss for key: ${key}`);
-      const result = await fn();
       
-      // Store result in cache
-      await this.set(key, result, ttl);
+      // Fetch fresh data
+      const freshData = await dataFetcher();
       
-      return result;
+      // Cache the result (don't await to avoid blocking)
+      this.set(key, freshData, ttlSeconds).catch(error => {
+        console.error('Background cache set failed:', error);
+      });
+
+      return freshData;
     } catch (error) {
       console.error('Cache wrapper error:', error);
-      // If cache fails, still return the function result
-      return await fn();
+      // If caching fails, still try to get fresh data
+      try {
+        return await dataFetcher();
+      } catch (fetchError) {
+        console.error('Data fetcher error:', fetchError);
+        throw fetchError;
+      }
+    }
+  }
+
+  // Method to check if Redis is healthy
+  async isHealthy() {
+    try {
+      if (!redisClient.isOpen) {
+        return false;
+      }
+      
+      await redisClient.ping();
+      return true;
+    } catch (error) {
+      console.error('Redis health check failed:', error);
+      return false;
+    }
+  }
+
+  // Method to reconnect if needed
+  async reconnect() {
+    try {
+      if (!redisClient.isOpen) {
+        await redisClient.connect();
+        console.log('Redis reconnected successfully');
+        return true;
+      }
+      return true;
+    } catch (error) {
+      console.error('Redis reconnection failed:', error);
+      return false;
     }
   }
 }
 
-module.exports = new CacheService();
+// Create singleton instance
+const cache = new CacheService();
+
+module.exports = cache;

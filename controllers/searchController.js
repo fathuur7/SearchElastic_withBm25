@@ -3,6 +3,28 @@ const pool = require('../config/db');
 const BM25 = require('../utils/bm25');
 const cache = require('../utils/cache');
 
+// Health check endpoint
+const healthCheck = async (req, res) => {
+  try {
+    const redisHealthy = await cache.isHealthy();
+    const esHealthy = await esClient.ping();
+    
+    res.json({
+      status: 'ok',
+      services: {
+        redis: redisHealthy ? 'healthy' : 'unhealthy',
+        elasticsearch: esHealthy ? 'healthy' : 'unhealthy',
+        database: 'assumed_healthy' // You could add a DB ping here
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
+};
+
 const getPapers = async (req, res) => {
   const { page = 1, limit = 5 } = req.query;
   const offset = (page - 1) * limit;
@@ -346,7 +368,23 @@ const getCacheStats = async (req, res) => {
   }
 };
 
+// Force Redis reconnection endpoint
+const reconnectRedis = async (req, res) => {
+  try {
+    const success = await cache.reconnect();
+    if (success) {
+      res.json({ message: 'Redis reconnected successfully' });
+    } else {
+      res.status(500).json({ error: 'Failed to reconnect to Redis' });
+    }
+  } catch (error) {
+    console.error('Reconnect Redis error:', error);
+    res.status(500).json({ error: 'Gagal reconnect ke Redis' });
+  }
+};
+
 module.exports = { 
+  healthCheck,
   searchPapers, 
   getDokumen, 
   getDetailPaper, 
@@ -355,5 +393,6 @@ module.exports = {
   GetAllArtikel, 
   autoComplete,
   clearCache,
-  getCacheStats
+  getCacheStats,
+  reconnectRedis
 };
